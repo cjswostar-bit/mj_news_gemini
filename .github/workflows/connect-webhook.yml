@@ -1,0 +1,55 @@
+
+name: Connect Telegram Webhook
+
+on:
+  workflow_dispatch:
+
+jobs:
+  connect-webhook:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Register Telegram Webhook
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["TELEGRAM_TOKEN"]
+          secret = os.environ["WEBHOOK_SECRET"]
+
+          webhook_url = (
+              "https://mj-personal-assistant.onrender.com/telegram"
+          )
+
+          data = urllib.parse.urlencode({
+              "url": webhook_url,
+              "secret_token": secret,
+              "allowed_updates": json.dumps(["message"]),
+              "drop_pending_updates": "false"
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/setWebhook",
+              data=data,
+              method="POST"
+          )
+
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
+              result = json.load(response)
+
+          if not result.get("ok"):
+              raise RuntimeError(
+                  result.get("description", "Webhook 설정 실패")
+              )
+
+          print("Telegram Webhook registration succeeded.")
+          print("Webhook URL:", webhook_url)
+          PY
