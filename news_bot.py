@@ -116,14 +116,9 @@ def run_keyword_monitor():
             if link in history:
                 continue
 
-            summary = clean_html(entry.get("summary", ""))
-            if len(summary) > 120:
-                summary = summary[:120] + "..."
-
-            msg = f"🚨 <b>[키워드 알림] {kw}</b>\n\n" \
-                  f"📌 <b>{title}</b>\n\n" \
-                  f"📝 {summary if summary else '본문은 아래 링크를 참고하세요.'}\n\n" \
-                  f"🔗 <a href='{link}'>기사 원문 보기</a>"
+            # [키워드 알림] 대신 [{kw}] 형태로 전송
+            msg = f"🚨 <b>[{kw}]</b>\n\n" \
+                  f"📌 <a href='{link}'>{title}</a>"
 
             send_telegram_text(msg)
             new_history.add(link)
