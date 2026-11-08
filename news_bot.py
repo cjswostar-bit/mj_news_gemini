@@ -41,7 +41,6 @@ SOURCES = {
     ],
 }
 
-# 시세 조회용 종목 코드
 MARKETS = {
     "SP500": "^GSPC",
     "NASDAQ": "^IXIC",
@@ -69,7 +68,7 @@ retry = Retry(
     total=2,
     backoff_factor=1,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET"]
+    allowed_methods=["GET"],
 )
 session.mount(
     "https://",
@@ -78,65 +77,39 @@ session.mount(
 
 
 # ==============================================
-# 2. 기본 보조 함수
+# 2. 기본 함수
 # ==============================================
 def now_kst():
     return datetime.now(KST)
 
 
-def clean(text):
-    value = BeautifulSoup(
-        str(text or ""), "html.parser"
+def clean(value):
+    text = BeautifulSoup(
+        str(value or ""), "html.parser"
     ).get_text(" ", strip=True)
 
     return re.sub(
-        r"\s+", " ", html.unescape(value)
+        r"\s+", " ", html.unescape(text)
     ).strip()
 
 
 def article_key(title):
-    normalized = clean(title).casefold()
     normalized = re.sub(
-        r"\s+", "", normalized
+        r"\s+", "", clean(title).casefold()
     )
     return hashlib.sha256(
         normalized.encode("utf-8")
     ).hexdigest()
 
 
-def fmt(value, digits=2):
-    if value is None:
-        return "N/A"
-    return f"{value:,.{digits}f}"
-
-
-def change_text(value, unit="%"):
-    if value is None:
-        return "N/A"
-    return f"{value:+.2f}{unit}"
-
-
-def get_json(url, params=None):
-    response = session.get(
-        url,
-        params=params,
-        timeout=15
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-# ==============================================
-# 3. 중복 기사 이력
-# ==============================================
 def load_history():
-    result = {
+    history = {
         "keyword": {},
-        "brief": {}
+        "brief": {},
     }
 
     if not HISTORY_FILE.exists():
-        return result
+        return history
 
     try:
         raw = json.loads(
@@ -146,50 +119,52 @@ def load_history():
         )
 
         if isinstance(raw, dict):
-            for mode in result:
+            for mode in history:
                 if isinstance(raw.get(mode), dict):
-                    result[mode] = raw[mode]
+                    history[mode] = raw[mode]
 
         elif isinstance(raw, list):
             stamp = now_kst().isoformat()
-            for mode in result:
-                result[mode] = {
-                    item: stamp
-                    for item in raw
-                    if isinstance(item, str)
+
+            for mode in history:
+                history[mode] = {
+                    url: stamp
+                    for url in raw
+                    if isinstance(url, str)
                 }
 
     except (OSError, ValueError) as exc:
         logging.warning(
-            "이력 불러오기 실패: %s", exc
+            "이력 읽기 실패: %s", exc
         )
 
-    return result
+    return history
 
 
 def save_history(history):
     cutoff = now_kst() - timedelta(days=45)
 
     for mode in ("keyword", "brief"):
-        cleaned = {}
+        kept = {}
 
-        for key, date_text in history[mode].items():
+        for key, value in history[mode].items():
             try:
-                dt = datetime.fromisoformat(
-                    date_text
-                )
+                dt = datetime.fromisoformat(value)
+
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=KST)
+
                 if dt >= cutoff:
-                    cleaned[key] = date_text
-            except (ValueError, TypeError):
+                    kept[key] = value
+
+            except (TypeError, ValueError):
                 continue
 
         history[mode] = dict(
             sorted(
-                cleaned.items(),
+                kept.items(),
                 key=lambda x: x[1],
-                reverse=True
+                reverse=True,
             )[:1500]
         )
 
@@ -197,18 +172,18 @@ def save_history(history):
         json.dumps(
             history,
             ensure_ascii=False,
-            indent=2
+            indent=2,
         ),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
 # ==============================================
-# 4. 텔레그램 전송
+# 3. 텔레그램 발송
 # ==============================================
 def telegram(method, data, files=None):
     url = (
-        "https://api.telegram.org/bot"
+        f"https://api.telegram.org/bot"
         f"{TOKEN}/{method}"
     )
 
@@ -216,7 +191,7 @@ def telegram(method, data, files=None):
         url,
         data=data,
         files=files,
-        timeout=30
+        timeout=30,
     )
     response.raise_for_status()
 
@@ -224,7 +199,10 @@ def telegram(method, data, files=None):
 
     if not result.get("ok"):
         raise RuntimeError(
-            result.get("description")
+            result.get(
+                "description",
+                "텔레그램 전송 실패"
+            )
         )
 
     return result
@@ -238,18 +216,17 @@ def send_text(message):
             "text": message,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
-        }
+        },
     )
 
 
 # ==============================================
-# 5. 뉴스 수집
+# 4. 뉴스 수집
 # ==============================================
 def read_feed(url):
     try:
         response = session.get(
-            url,
-            timeout=20
+            url, timeout=20
         )
         response.raise_for_status()
 
@@ -262,9 +239,13 @@ def read_feed(url):
 
         return feed.entries[:15]
 
-    except (requests.RequestException, ValueError) as exc:
+    except (
+        requests.RequestException,
+        ValueError,
+    ) as exc:
         logging.warning(
-            "RSS 실패 %s: %s", url, exc
+            "RSS 수집 실패 %s: %s",
+            url, exc
         )
         return []
 
@@ -275,163 +256,179 @@ def published_at(entry):
         or entry.get("updated_parsed")
     )
 
-    if not value:
-        return None
+    if value:
+        try:
+            return datetime(
+                *value[:6],
+                tzinfo=timezone.utc,
+            ).astimezone(KST)
+        except (ValueError, TypeError):
+            pass
 
-    try:
-        return datetime(
-            *value[:6],
-            tzinfo=timezone.utc
-        ).astimezone(KST)
-    except (ValueError, TypeError):
-        return None
-
-
-def parse_article(entry):
-    title = clean(entry.get("title"))
-    link = str(entry.get("link", "")).strip()
-
-    if (
-        not title
-        or urlparse(link).scheme
-        not in ("http", "https")
-    ):
-        return None
-
-    return {
-        "title": title,
-        "link": link,
-        "summary": entry.get("summary", ""),
-        "date": published_at(entry),
-        "key": article_key(title),
-    }
+    return None
 
 
-def collect_articles(urls, age_hours=48):
-    items = []
+def collect_articles(urls, hours):
     cutoff = now_kst() - timedelta(
-        hours=age_hours
+        hours=hours
     )
+    articles = []
 
     for url in urls:
         for entry in read_feed(url):
-            article = parse_article(entry)
+            title = clean(
+                entry.get("title")
+            )
+            link = str(
+                entry.get("link", "")
+            ).strip()
 
-            if not article:
+            if (
+                not title
+                or urlparse(link).scheme
+                not in ("https", "http")
+            ):
                 continue
 
-            date = article["date"]
+            date = published_at(entry)
+
             if date and date < cutoff:
                 continue
 
-            items.append(article)
+            articles.append({
+                "title": title,
+                "link": link,
+                "date": date,
+                "summary": entry.get(
+                    "summary", ""
+                ),
+                "key": article_key(title),
+            })
 
-    items.sort(
-        key=lambda a: (
-            a["date"]
-            or datetime.min.replace(tzinfo=KST)
+    articles.sort(
+        key=lambda item: (
+            item["date"]
+            or datetime.min.replace(
+                tzinfo=KST
+            )
         ),
-        reverse=True
+        reverse=True,
     )
 
-    return items
+    return articles
 
 
 # ==============================================
-# 6. 뉴스 요약 및 메시지
+# 5. 기사 요약과 날짜 표시
 # ==============================================
 def get_summary(article):
-    summary = clean(article["summary"])
+    text = clean(
+        article["summary"]
+    )
 
     if (
-        len(summary) < 45
-        or summary.casefold().startswith(
+        len(text) < 45
+        or text.casefold().startswith(
             article["title"].casefold()[:45]
         )
     ):
-        summary = ""
+        text = ""
 
     host = urlparse(
         article["link"]
     ).netloc.lower()
 
     if (
-        not summary
+        not text
         and "news.google.com" not in host
     ):
         try:
             response = session.get(
                 article["link"],
-                timeout=10
+                timeout=10,
             )
             response.raise_for_status()
+
             soup = BeautifulSoup(
                 response.text,
-                "html.parser"
+                "html.parser",
             )
 
-            meta = soup.find(
+            tag = soup.find(
                 "meta",
-                attrs={"name": "description"}
+                attrs={
+                    "name": "description"
+                },
             )
 
-            if not meta:
-                meta = soup.find(
+            if not tag:
+                tag = soup.find(
                     "meta",
                     attrs={
                         "property": "og:description"
-                    }
+                    },
                 )
 
-            if meta:
-                summary = clean(
-                    meta.get("content", "")
-                )
+            text = (
+                clean(tag.get("content", ""))
+                if tag else ""
+            )
 
         except requests.RequestException:
             pass
 
-    if not summary:
+    if not text:
         return (
             "요약 정보가 없습니다. "
             "원문 링크에서 확인해 주세요."
         )
 
     return (
-        summary[:170]
-        + ("…" if len(summary) > 170 else "")
+        text[:170]
+        + ("…" if len(text) > 170 else "")
     )
 
 
 def article_message(article, header=""):
-    title = html.escape(article["title"])
+    title = html.escape(
+        article["title"]
+    )
     summary = html.escape(
         get_summary(article)
     )
     link = html.escape(
         article["link"],
-        quote=True
+        quote=True,
     )
 
     if article["date"]:
-        date_text = article["date"].strftime(
+        stamp = article["date"].strftime(
             "%m/%d %H:%M"
         )
     else:
-        date_text = "날짜 미상"
+        stamp = "날짜 미상"
 
     return (
         f"{header}\n"
-        f"<b>📰 {title} [{date_text}]</b>\n"
+        f"<b>📰 {title} [{stamp}]</b>\n"
         f"📝 {summary}\n"
         f'🔗 <a href="{link}">기사 보기</a>'
     )
 
 
 # ==============================================
-# 7. 주요 증시, 환율, 유가, 금리
-# Yahoo 차트 데이터의 최근 종가 사용
+# 6. 시세 데이터 조회
 # ==============================================
+def get_json(url, params=None):
+    response = session.get(
+        url,
+        params=params,
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def get_market_data():
     result = {}
 
@@ -445,63 +442,80 @@ def get_market_data():
 
             data = get_json(
                 url,
-                params={
+                {
                     "range": "10d",
                     "interval": "1d",
-                }
+                },
             )
 
             info = data["chart"]["result"][0]
-            quotes = info["indicators"]["quote"][0]
-            closes = quotes.get("close", [])
-            times = info.get("timestamp", [])
+            closes = info["indicators"]["quote"][0]["close"]
+            stamps = info.get(
+                "timestamp", []
+            )
 
             valid = [
-                (float(price), timestamp)
-                for price, timestamp
-                in zip(closes, times)
-                if price is not None
+                (float(v), t)
+                for v, t in zip(
+                    closes, stamps
+                )
+                if v is not None
             ]
 
             if not valid:
-                raise ValueError("가격 없음")
+                raise ValueError(
+                    "유효한 종가가 없습니다"
+                )
 
-            price, timestamp = valid[-1]
+            price, stamp = valid[-1]
 
             previous = (
                 valid[-2][0]
-                if len(valid) >= 2 else None
+                if len(valid) > 1
+                else None
             )
 
-            change = None
-            if previous and previous != 0:
-                change = (
-                    (price / previous - 1) * 100
-                )
+            change = (
+                (price / previous - 1) * 100
+                if previous
+                else None
+            )
 
-            market_date = datetime.fromtimestamp(
-                timestamp,
-                tz=timezone.utc
-            ).astimezone(KST)
+            exchange_tz = info.get(
+                "meta", {}
+            ).get(
+                "exchangeTimezoneName",
+                "UTC",
+            )
+
+            try:
+                market_tz = ZoneInfo(
+                    exchange_tz
+                )
+            except (KeyError, ValueError):
+                market_tz = timezone.utc
+
+            market_day = datetime.fromtimestamp(
+                stamp,
+                tz=market_tz,
+            ).strftime("%m/%d")
 
             result[name] = {
                 "price": price,
-                "change": change,
-                "date": market_date.strftime(
-                    "%m/%d"
-                ),
                 "previous": previous,
+                "change": change,
+                "date": market_day,
             }
 
         except (
             requests.RequestException,
+            ValueError,
             KeyError,
             IndexError,
-            ValueError,
-            TypeError
+            TypeError,
         ) as exc:
             logging.warning(
-                "%s 시세 조회 실패: %s",
+                "시세 조회 실패 %s: %s",
                 name, exc
             )
             result[name] = {}
@@ -510,7 +524,7 @@ def get_market_data():
 
 
 # ==============================================
-# 8. 가상자산 원화 시세: 업비트
+# 7. 코인 시세: 업비트 KRW
 # ==============================================
 def get_krw_coins():
     result = {}
@@ -518,77 +532,51 @@ def get_krw_coins():
     try:
         data = get_json(
             "https://api.upbit.com/v1/ticker",
-            params={
+            {
                 "markets": ",".join(
-                    f"KRW-{coin}"
-                    for coin in COINS
+                    "KRW-" + symbol
+                    for symbol in COINS
                 )
-            }
+            },
         )
 
         for item in data:
-            symbol = item["market"].replace(
-                "KRW-", ""
+            symbol = item.get(
+                "market", ""
+            ).replace("KRW-", "")
+
+            if symbol not in COINS:
+                continue
+
+            timestamp = (
+                item.get("timestamp")
+                or item.get("trade_timestamp")
+            )
+
+            observed = (
+                datetime.fromtimestamp(
+                    timestamp / 1000,
+                    tz=KST,
+                ).strftime("%H:%M")
+                if timestamp
+                else None
             )
 
             result[symbol] = {
-                "price": item.get("trade_price"),
-                "change": (
-                    item.get("signed_change_rate")
-                    * 100
-                    if item.get(
-                        "signed_change_rate"
-                    ) is not None
-                    else None
-                )
+                "price": item.get(
+                    "trade_price"
+                ),
+                "observed": observed,
             }
 
     except (
         requests.RequestException,
         ValueError,
         KeyError,
-        TypeError
+        TypeError,
     ) as exc:
         logging.warning(
-            "업비트 조회 실패: %s", exc
-        )
-
-    return result
-
-
-# ==============================================
-# 9. 가상자산 달러 시세: CoinGecko
-# ==============================================
-def get_usd_coins():
-    result = {}
-
-    try:
-        data = get_json(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={
-                "ids": ",".join(COINS.values()),
-                "vs_currencies": "usd",
-                "include_24hr_change": "true",
-            }
-        )
-
-        for symbol, coin_id in COINS.items():
-            item = data.get(coin_id, {})
-
-            result[symbol] = {
-                "price": item.get("usd"),
-                "change": item.get(
-                    "usd_24h_change"
-                )
-            }
-
-    except (
-        requests.RequestException,
-        ValueError,
-        TypeError
-    ) as exc:
-        logging.warning(
-            "CoinGecko 조회 실패: %s",
+            "업비트 시세 조회 실패: %s",
             exc
         )
 
@@ -596,329 +584,618 @@ def get_usd_coins():
 
 
 # ==============================================
-# 10. 대시보드 디자인 보조 함수
+# 8. 코인 시세: CoinGecko USD / 24h
 # ==============================================
-def font(size, bold=False):
-    root = "/usr/share/fonts/truetype/nanum/"
-    name = (
+def get_usd_coins():
+    result = {}
+
+    try:
+        data = get_json(
+            "https://api.coingecko.com/api/v3/simple/price",
+            {
+                "ids": ",".join(
+                    COINS.values()
+                ),
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+                "include_last_updated_at": "true",
+            },
+        )
+
+        for symbol, coin_id in COINS.items():
+            item = data.get(
+                coin_id, {}
+            )
+
+            ts = item.get(
+                "last_updated_at"
+            )
+
+            observed = (
+                datetime.fromtimestamp(
+                    ts, tz=KST
+                ).strftime("%H:%M")
+                if ts else None
+            )
+
+            result[symbol] = {
+                "price": item.get("usd"),
+                "change_24h": item.get(
+                    "usd_24h_change"
+                ),
+                "observed": observed,
+            }
+
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+    ) as exc:
+        logging.warning(
+            "달러 코인 시세 조회 실패: %s",
+            exc
+        )
+
+    return result
+
+
+# ==============================================
+# 9. 시세 이미지 디자인 설정
+# ==============================================
+BG = "#F0F4FA"
+WHITE = "#FFFFFF"
+NAVY = "#162840"
+TEXT = "#14263E"
+MUTED = "#66788F"
+LINE = "#DDE5EF"
+
+# 상승은 빨간색, 하락은 파란색
+UP = "#D63848"
+DOWN = "#1769C2"
+NEUTRAL = "#596B81"
+
+
+def fnt(size, bold=False):
+    directory = (
+        "/usr/share/fonts/truetype/nanum/"
+    )
+    filename = (
         "NanumGothicBold.ttf"
-        if bold else "NanumGothic.ttf"
+        if bold
+        else "NanumGothic.ttf"
     )
 
     try:
         return ImageFont.truetype(
-            root + name, size
+            directory + filename,
+            size,
         )
     except OSError:
         return ImageFont.load_default()
 
 
-def draw_label(draw, xy, text, size=23, color="#CBD5E1", bold=False):
+def put(
+    draw, x, y, value,
+    size=28, color=TEXT,
+    bold=False, right=None,
+):
+    value = str(value)
+    selected = fnt(size, bold)
+
+    if right is not None:
+        box = draw.textbbox(
+            (0, 0),
+            value,
+            font=selected,
+        )
+        x = right - (
+            box[2] - box[0]
+        )
+
     draw.text(
-        xy, str(text),
-        font=font(size, bold),
-        fill=color
+        (x, y),
+        value,
+        font=selected,
+        fill=color,
     )
 
 
-def draw_card(draw, x, y, w, h, title):
+def number(value, digits=2):
+    if isinstance(
+        value, (int, float)
+    ):
+        return f"{value:,.{digits}f}"
+    return "N/A"
+
+
+def percent(value):
+    if isinstance(
+        value, (int, float)
+    ):
+        return f"{value:+.2f}%"
+    return "N/A"
+
+
+def trend_color(value):
+    if value is None:
+        return NEUTRAL
+
+    if value > 0:
+        return UP
+
+    if value < 0:
+        return DOWN
+
+    return NEUTRAL
+
+
+# ==============================================
+# 10. 카드 및 숫자 그리기
+# ==============================================
+def card(
+    draw, x, y,
+    width, height,
+    title, subtitle=None,
+):
     draw.rounded_rectangle(
-        (x, y, x+w, y+h),
-        radius=18,
-        fill="#222B40",
-        outline="#38465F",
-        width=2
+        (
+            x, y,
+            x + width,
+            y + height,
+        ),
+        radius=22,
+        fill=WHITE,
+        outline=LINE,
+        width=2,
     )
 
-    draw_label(
-        draw,
-        (x+24, y+19),
-        title,
-        27,
-        "#FFFFFF",
-        True
+    draw.rounded_rectangle(
+        (
+            x + 22, y + 24,
+            x + 29, y + 61,
+        ),
+        radius=3,
+        fill="#2D6CDF",
     )
+
+    put(
+        draw,
+        x + 43, y + 20,
+        title,
+        35, NAVY, True,
+    )
+
+    if subtitle:
+        put(
+            draw,
+            x + 25, y + 69,
+            subtitle,
+            20, MUTED,
+        )
 
     draw.line(
-        (x+24, y+66, x+w-24, y+66),
-        fill="#3B4961",
-        width=2
+        (
+            x + 25, y + 103,
+            x + width - 25, y + 103,
+        ),
+        fill=LINE,
+        width=2,
     )
 
 
-def color_change(value):
-    if value is None:
-        return "#94A3B8"
-    if value > 0:
-        return "#FB7185"
-    if value < 0:
-        return "#60A5FA"
-    return "#CBD5E1"
+def stock_row(
+    draw, x, y, width,
+    label, data,
+    digits=2, suffix="",
+):
+    date = data.get("date")
 
-
-def draw_market_row(draw, x, y, name, data, digits=2, suffix=""):
-    value = data.get("price")
-    change = data.get("change")
-
-    draw_label(
-        draw, (x, y),
-        name, 24, "#CBD5E1", True
+    put(
+        draw,
+        x + 26, y,
+        label,
+        26, MUTED, True,
     )
+
+    put(
+        draw, 0, y + 3,
+        f"{date} 종가"
+        if date
+        else "조회 불가",
+        19, MUTED,
+        right=x + width - 27,
+    )
+
+    price = data.get("price")
 
     price_text = (
-        fmt(value, digits) + suffix
-        if value is not None else "N/A"
+        number(price, digits) + suffix
+        if price is not None
+        else "N/A"
     )
 
-    draw_label(
-        draw, (x+155, y),
-        price_text, 25, "#FFFFFF", True
+    put(
+        draw,
+        x + 26, y + 32,
+        price_text,
+        39, TEXT, True,
     )
 
-    draw_label(
-        draw, (x+375, y+2),
-        change_text(change),
-        21, color_change(change), True
+    change = data.get("change")
+
+    put(
+        draw, 0, y + 42,
+        percent(change),
+        25,
+        trend_color(change),
+        True,
+        right=x + width - 27,
     )
 
 
-def draw_coin_row(draw, x, y, symbol, krw, usd):
+def coin_row(
+    draw, x, y, width,
+    symbol, krw, usd,
+):
     a = krw.get(symbol, {})
     b = usd.get(symbol, {})
 
-    krw_price = a.get("price")
-    usd_price = b.get("price")
-
-    krw_text = (
-        fmt(
-            krw_price,
-            0 if krw_price >= 1000 else 2
-        )
-        if krw_price is not None else "N/A"
+    k = a.get("price")
+    u = b.get("price")
+    change = b.get(
+        "change_24h"
     )
 
-    usd_text = (
-        fmt(
-            usd_price,
-            2 if usd_price >= 1 else 4
-        )
-        if usd_price is not None else "N/A"
+    put(
+        draw,
+        x + 26, y,
+        symbol,
+        30, TEXT, True,
     )
 
-    draw_label(
-        draw, (x, y),
-        symbol, 24, "#FFFFFF", True
+    put(
+        draw, 0, y + 2,
+        percent(change),
+        27,
+        trend_color(change),
+        True,
+        right=x + width - 27,
     )
 
-    draw_label(
-        draw, (x+100, y),
-        krw_text, 23, "#E2E8F0"
+    krw_text = number(
+        k,
+        0 if k is not None
+        and k >= 1000
+        else 2,
     )
 
-    draw_label(
-        draw, (x+345, y),
-        "$" + usd_text, 23, "#E2E8F0"
+    usd_text = number(
+        u,
+        2 if u is not None
+        and u >= 1
+        else 4,
+    )
+
+    put(
+        draw,
+        x + 26, y + 39,
+        f"₩ {krw_text}",
+        29, NAVY, True,
+    )
+
+    put(
+        draw, 0, y + 39,
+        f"$ {usd_text}",
+        28, NAVY, True,
+        right=x + width - 27,
     )
 
 
 # ==============================================
-# 11. 시세 대시보드 이미지 생성
+# 11. 새로운 시세 대시보드 생성
 # ==============================================
 def draw_dashboard(path="dashboard.png"):
-    W, H = 1320, 1080
+    width, height = 1280, 1510
 
-    image = Image.new(
-        "RGB", (W, H), "#111827"
+    img = Image.new(
+        "RGB",
+        (width, height),
+        BG,
     )
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(img)
 
-    now = now_kst().strftime(
-        "%Y-%m-%d %H:%M KST"
-    )
-
-    draw_label(
-        draw, (45, 30),
-        "DAILY MARKET DASHBOARD",
-        37, "#FFFFFF", True
-    )
-
-    draw_label(
-        draw, (47, 84),
-        now, 22, "#94A3B8"
+    # 상단 제목 영역
+    draw.rounded_rectangle(
+        (28, 26, 1252, 155),
+        radius=24,
+        fill=NAVY,
     )
 
-    draw.line(
-        (45, 125, 1275, 125),
-        fill="#46536A", width=2
+    put(
+        draw, 59, 43,
+        "DAILY MARKET",
+        44, WHITE, True,
     )
 
+    put(
+        draw, 59, 101,
+        "시장 시세 브리핑",
+        27, "#BDD3F5", True,
+    )
+
+    put(
+        draw, 0, 102,
+        now_kst().strftime(
+            "%Y-%m-%d %H:%M KST"
+        ),
+        23, WHITE,
+        right=1215,
+    )
+
+    # 시세 조회
     market = get_market_data()
     krw = get_krw_coins()
     usd = get_usd_coins()
 
-    # 카드 배치
-    left, right = 45, 675
-    card_w = 600
+    # 카드 좌표
+    lx = 28
+    rx = 654
+    cw = 598
 
-    # 1행: 미국증시 / 한국증시
-    draw_card(
-        draw, left, 150,
-        card_w, 245, "미국 증시"
-    )
-    draw_card(
-        draw, right, 150,
-        card_w, 245, "한국 증시"
+    # ------------------------------------------
+    # 1행: 미국 증시 / 한국 증시
+    # ------------------------------------------
+    card(
+        draw,
+        lx, 178, cw, 298,
+        "미국 증시",
+        "미국 거래소 기준 최근 종가",
     )
 
-    draw_market_row(
-        draw, left+24, 245,
+    card(
+        draw,
+        rx, 178, cw, 298,
+        "한국 증시",
+        "한국 거래소 기준 최근 종가",
+    )
+
+    stock_row(
+        draw, lx, 294, cw,
         "S&P 500",
-        market.get("SP500", {})
+        market.get("SP500", {}),
     )
-    draw_market_row(
-        draw, left+24, 315,
+
+    stock_row(
+        draw, lx, 387, cw,
         "NASDAQ",
-        market.get("NASDAQ", {})
+        market.get("NASDAQ", {}),
     )
 
-    draw_market_row(
-        draw, right+24, 245,
+    stock_row(
+        draw, rx, 294, cw,
         "KOSPI",
-        market.get("KOSPI", {})
+        market.get("KOSPI", {}),
     )
-    draw_market_row(
-        draw, right+24, 315,
+
+    stock_row(
+        draw, rx, 387, cw,
         "KOSDAQ",
-        market.get("KOSDAQ", {})
+        market.get("KOSDAQ", {}),
     )
 
-    # 2행: 코인 / 환율
-    draw_card(
-        draw, left, 420,
-        card_w, 325, "가상자산"
-    )
-    draw_card(
-        draw, right, 420,
-        card_w, 325, "환율"
+    # ------------------------------------------
+    # 2행: 가상자산 / 환율
+    # ------------------------------------------
+    card(
+        draw,
+        lx, 495, cw, 468,
+        "가상자산",
+        "원화: 업비트  |  달러·24h: CoinGecko",
     )
 
-    draw_label(
-        draw, (left+124, 498),
-        "KRW (업비트)",
-        18, "#94A3B8"
-    )
-    draw_label(
-        draw, (left+369, 498),
-        "USD (CoinGecko)",
-        18, "#94A3B8"
+    card(
+        draw,
+        rx, 495, cw, 468,
+        "달러 환율",
+        "USD/KRW · 최근 종가",
     )
 
     for i, symbol in enumerate(COINS):
-        draw_coin_row(
+        coin_row(
             draw,
-            left+24,
-            540 + i*46,
-            symbol, krw, usd
+            lx,
+            616 + 87 * i,
+            cw,
+            symbol,
+            krw,
+            usd,
         )
 
-    fx = market.get("USD/KRW", {})
-    fx_price = fx.get("price")
-
-    draw_label(
-        draw, (right+27, 525),
-        "USD / KRW",
-        26, "#CBD5E1", True
+    fx = market.get(
+        "USD/KRW", {}
     )
 
-    draw_label(
-        draw, (right+27, 585),
+    put(
+        draw,
+        rx + 27, 623,
+        "1 USD",
+        28, MUTED, True,
+    )
+
+    value = fx.get("price")
+
+    put(
+        draw,
+        rx + 27, 682,
         (
-            fmt(fx_price, 2) + " KRW"
-            if fx_price is not None
+            number(value) + " KRW"
+            if value is not None
             else "N/A"
         ),
-        40, "#FFFFFF", True
+        48, NAVY, True,
     )
 
-    draw_label(
-        draw, (right+27, 665),
-        "전일 대비 "
-        + change_text(fx.get("change")),
-        24,
-        color_change(fx.get("change")),
-        True
+    put(
+        draw,
+        rx + 27, 761,
+        "전일 대비",
+        26, MUTED,
     )
 
-    # 3행: 유가 / 금리
-    draw_card(
-        draw, left, 770,
-        card_w, 235, "국제 유가"
-    )
-    draw_card(
-        draw, right, 770,
-        card_w, 235, "미국 국채금리"
+    put(
+        draw,
+        rx + 27, 805,
+        percent(
+            fx.get("change")
+        ),
+        35,
+        trend_color(
+            fx.get("change")
+        ),
+        True,
     )
 
-    draw_market_row(
-        draw, left+24, 860,
+    put(
+        draw,
+        rx + 27, 860,
+        (
+            "가격 기준: "
+            + (
+                fx.get("date")
+                or "조회 불가"
+            )
+        ),
+        22, MUTED,
+    )
+
+    # ------------------------------------------
+    # 3행: 국제 유가 / 미국 국채금리
+    # ------------------------------------------
+    card(
+        draw,
+        lx, 984, cw, 297,
+        "국제 유가",
+        "WTI · Brent / USD per barrel",
+    )
+
+    card(
+        draw,
+        rx, 984, cw, 297,
+        "미국 10년물 국채금리",
+        "금리 수준 및 전일 대비 bp",
+    )
+
+    stock_row(
+        draw,
+        lx, 1100, cw,
         "WTI",
         market.get("WTI", {}),
-        2, " USD"
+        suffix=" USD",
     )
-    draw_market_row(
-        draw, left+24, 930,
+
+    stock_row(
+        draw,
+        lx, 1193, cw,
         "Brent",
         market.get("BRENT", {}),
-        2, " USD"
+        suffix=" USD",
     )
 
-    rate = market.get("US10Y", {})
-    rate_value = rate.get("price")
-
-    draw_label(
-        draw, (right+27, 862),
-        "10년물",
-        28, "#CBD5E1", True
+    bond = market.get(
+        "US10Y", {}
     )
-    draw_label(
-        draw, (right+205, 857),
+
+    put(
+        draw,
+        rx + 28, 1112,
         (
-            fmt(rate_value, 3) + "%"
-            if rate_value is not None
+            "기준: "
+            + (
+                bond.get("date")
+                or "조회 불가"
+            )
+        ),
+        23, MUTED,
+    )
+
+    current = bond.get("price")
+    previous = bond.get("previous")
+
+    put(
+        draw,
+        rx + 28, 1162,
+        (
+            number(current, 3) + "%"
+            if current is not None
             else "N/A"
         ),
-        35, "#FFFFFF", True
+        50, NAVY, True,
     )
 
-    # 금리는 퍼센트 변동률보다
-    # 전일 대비 bp 변화가 직관적
-    previous = rate.get("previous")
-    if rate_value is not None and previous is not None:
-        bp = (rate_value - previous) * 100
-        bp_text = f"{bp:+.1f}bp"
-    else:
-        bp = None
-        bp_text = "N/A"
-
-    draw_label(
-        draw, (right+27, 942),
-        "전일 대비 " + bp_text,
-        23, color_change(bp), True
+    bp = (
+        (current - previous) * 100
+        if current is not None
+        and previous is not None
+        else None
     )
 
-    # 출처 및 주의 문구
-    draw_label(
-        draw, (45, 1022),
-        "증시/환율/유가/금리: 최근 종가 | 코인: 조회 시점 현재가",
-        18, "#94A3B8"
-    )
-    draw_label(
-        draw, (45, 1048),
-        "출처: Yahoo Finance / Upbit / CoinGecko | N/A = 조회 실패",
-        17, "#94A3B8"
+    put(
+        draw, 0, 1186,
+        (
+            f"{bp:+.1f} bp"
+            if bp is not None
+            else "N/A"
+        ),
+        29,
+        trend_color(bp),
+        True,
+        right=rx + cw - 28,
     )
 
-    image.save(path)
+    # ------------------------------------------
+    # 하단 색상 범례 및 데이터 출처
+    # ------------------------------------------
+    draw.line(
+        (44, 1323, 1236, 1323),
+        fill=LINE,
+        width=2,
+    )
+
+    put(
+        draw,
+        48, 1345,
+        "상승",
+        25, UP, True,
+    )
+
+    put(
+        draw,
+        122, 1345,
+        "/ 하락",
+        25, DOWN, True,
+    )
+
+    put(
+        draw,
+        48, 1392,
+        (
+            "주식·환율·유가·금리: 최근 종가"
+            "  |  코인: 조회 시점 가격"
+        ),
+        23, MUTED,
+    )
+
+    put(
+        draw,
+        48, 1434,
+        (
+            "출처: Yahoo Finance · Upbit · "
+            "CoinGecko  |  N/A = 조회 실패"
+        ),
+        21, MUTED,
+    )
+
+    img.save(path)
     return path
 
 
@@ -936,10 +1213,11 @@ def send_dashboard():
                         + now_kst().strftime(
                             "%m/%d %H:%M"
                         )
-                    )
+                    ),
                 },
-                files={"photo": photo}
+                files={"photo": photo},
             )
+
     finally:
         Path(path).unlink(
             missing_ok=True
@@ -947,28 +1225,28 @@ def send_dashboard():
 
 
 # ==============================================
-# 12. 농협 키워드 뉴스 발송
+# 12. 농협 키워드 뉴스
 # ==============================================
 def run_keyword(history):
-    keywords = [
-        "농협",
-        "농협금융"
-    ]
-
     urls = [
         (
             "https://news.google.com/rss/search"
             f"?q={quote(word)}"
             "&hl=ko&gl=KR&ceid=KR:ko"
         )
-        for word in keywords
+        for word in (
+            "농협",
+            "농협금융",
+        )
     ]
 
     articles = collect_articles(
-        urls, age_hours=48
+        urls, 48
     )
 
-    seen = set(history["keyword"])
+    seen = set(
+        history["keyword"]
+    )
     count = 0
 
     for article in articles:
@@ -984,9 +1262,10 @@ def run_keyword(history):
             send_text(
                 article_message(
                     article,
-                    "🚨 <b>[농협 관련 뉴스]</b>"
+                    "🚨 <b>[농협 관련 뉴스]</b>",
                 )
             )
+
         except Exception:
             logging.exception(
                 "키워드 기사 전송 실패"
@@ -1004,12 +1283,13 @@ def run_keyword(history):
             break
 
     logging.info(
-        "키워드 발송: %d건", count
+        "키워드 뉴스 발송: %d건",
+        count,
     )
 
 
 # ==============================================
-# 13. 정기 뉴스 브리핑
+# 13. 정기 종합 뉴스 브리핑
 # ==============================================
 def run_brief(history):
     try:
@@ -1019,47 +1299,44 @@ def run_brief(history):
             "대시보드 전송 실패"
         )
 
-    total = 0
+    count = 0
 
     for category, urls in SOURCES.items():
-        articles = collect_articles(
-            urls, age_hours=72
+        selected = []
+        seen = set(
+            history["brief"]
         )
 
-        selected = []
-        seen = set(history["brief"])
-
-        for article in articles:
-            key = article["key"]
-
+        for article in collect_articles(
+            urls, 72
+        ):
             if (
-                key in seen
+                article["key"] in seen
                 or article["link"] in seen
             ):
                 continue
 
             selected.append(article)
-            seen.add(key)
+            seen.add(
+                article["key"]
+            )
 
             if len(selected) >= 4:
                 break
 
-        if not selected:
-            continue
-
-        header = (
-            "📰 <b>["
-            + html.escape(category)
-            + "]</b>"
-        )
-
-        # 개별 발송하여 성공한 기사만 기록
         for i, article in enumerate(selected):
             try:
+                header = (
+                    f"📰 <b>["
+                    f"{html.escape(category)}"
+                    f"]</b>"
+                    if i == 0
+                    else ""
+                )
+
                 send_text(
                     article_message(
-                        article,
-                        header if i == 0 else ""
+                        article, header
                     )
                 )
 
@@ -1067,15 +1344,16 @@ def run_brief(history):
                     article["key"]
                 ] = now_kst().isoformat()
 
-                total += 1
+                count += 1
 
             except Exception:
                 logging.exception(
-                    "브리핑 기사 전송 실패"
+                    "종합 브리핑 기사 전송 실패"
                 )
 
     logging.info(
-        "종합 뉴스 발송: %d건", total
+        "종합 브리핑 뉴스 발송: %d건",
+        count,
     )
 
 
@@ -1087,21 +1365,27 @@ def main():
 
     parser.add_argument(
         "--mode",
-        choices=["keyword", "brief"],
-        required=True
+        choices=[
+            "keyword",
+            "brief",
+        ],
+        required=True,
     )
 
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(levelname)s: %(message)s"
+        format=(
+            "%(levelname)s: "
+            "%(message)s"
+        ),
     )
 
     if not TOKEN or not CHAT_ID:
         raise RuntimeError(
             "GitHub Secrets의 "
-            "TELEGRAM_TOKEN 또는 CHAT_ID를 "
+            "TELEGRAM_TOKEN / CHAT_ID를 "
             "확인하세요."
         )
 
@@ -1112,6 +1396,7 @@ def main():
             run_keyword(history)
         else:
             run_brief(history)
+
     finally:
         save_history(history)
 
