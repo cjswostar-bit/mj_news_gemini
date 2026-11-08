@@ -1,172 +1,744 @@
-import os
-import json
-import re
+
 import argparse
-import datetime
-import requests
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
+
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-HISTORY_FILE = "history.json"
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+HISTORY_FILE = Path("history.json")
+KST = ZoneInfo("Asia/Seoul")
 
-# 언론사별 RSS 출처
-BRIEFING_RSS_SOURCES = {
+# 정기 브리핑용 언론사 RSS
+SOURCES = {
     "📈 경제/증시/코인": [
         "https://www.hankyung.com/feed/economy",
-        "https://www.mk.co.kr/rss/30000001/"
+        "https://www.mk.co.kr/rss/30000001/",
     ],
     "⚖️ 정치/사회/시사": [
         "https://www.hani.co.kr/rss/",
         "https://www.khan.co.kr/rss/rssdata/total_news.xml",
-        "https://www.sisain.co.kr/rss/S1N1.xml"
+        "https://www.sisain.co.kr/rss/S1N1.xml",
     ],
     "🌐 국제": [
-        "https://news.google.com/rss/headlines/section/topic/WORLD?hl=ko&gl=KR&ceid=KR:ko"
-    ]
+        "https://news.google.com/rss/headlines/section/topic/WORLD?hl=ko&gl=KR&ceid=KR:ko",
+    ],
 }
 
+# RSS / 시세 조회 시 일시적 오류 재시도
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; NewsBriefingBot/2.0)"
+})
+
+retry = Retry(
+    total=2,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+session.mount("https://", HTTPAdapter(max_retries=retry))
+
+
+# --------------------------------------------------
+# 1. 기사 제목 및 텍스트 정리
+# --------------------------------------------------
+def clean(text):
+    value = BeautifulSoup(
+        str(text or ""), "html.parser"
+    ).get_text(" ", strip=True)
+
+    return re.sub(
+        r"\s+", " ", html.unescape(value)
+    ).strip()
+
+
+def history_key(title):
+    title = re.sub(
+        r"\s*[-|]\s*[^-|]{1,35}$",
+        "",
+        clean(title)
+    )
+    normalized = re.sub(
+        r"\s+", "", title
+    ).casefold()
+
+    return hashlib.sha256(
+        normalized.encode("utf-8")
+    ).hexdigest()
+
+
+# --------------------------------------------------
+# 2. 중복 기사 기록 관리
+# 키워드와 정기 브리핑의 이력은 별도 관리
+# --------------------------------------------------
 def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
+    empty = {"keyword": {}, "brief": {}}
+
+    if not HISTORY_FILE.exists():
+        return empty
+
+    try:
+        raw = json.loads(
+            HISTORY_FILE.read_text(encoding="utf-8")
+        )
+
+        if isinstance(raw, dict):
+            for mode in empty:
+                if isinstance(raw.get(mode), dict):
+                    empty[mode] = raw[mode]
+
+        elif isinstance(raw, list):
+            # 기존 버전의 history.json도 읽을 수 있도록 처리
+            timestamp = datetime.now(KST).isoformat()
+            empty = {
+                mode: {
+                    url: timestamp
+                    for url in raw
+                    if isinstance(url, str)
+                }
+                for mode in empty
+            }
+
+    except (ValueError, OSError) as exc:
+        logging.warning("이력 읽기 실패: %s", exc)
+
+    return empty
+
 
 def save_history(history):
-    history_list = list(history)[-1000:]
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history_list, f, ensure_ascii=False, indent=2)
+    cutoff = datetime.now(KST) - timedelta(days=45)
 
-def send_telegram_text(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
-    requests.post(url, data=payload)
+    for mode in ("keyword", "brief"):
+        retained = {}
 
-def send_telegram_photo(photo_path, caption=""):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    with open(photo_path, "rb") as photo:
-        payload = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-        files = {"photo": photo}
-        requests.post(url, data=payload, files=files)
+        for key, saved_at in history[mode].items():
+            try:
+                saved_time = datetime.fromisoformat(saved_at)
 
-def clean_html(text):
-    soup = BeautifulSoup(text, "html.parser")
-    cleaned = soup.get_text()
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
+                if saved_time >= cutoff:
+                    retained[key] = saved_at
 
-def create_dashboard_image(output_path="dashboard.png"):
-    """실시간 시세 대시보드 이미지 생성"""
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    width, height = 800, 300
-    img = Image.new("RGB", (width, height), color="#1e1e2e")
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf", 24)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 16)
-    except:
-        font_title = font_sub = ImageFont.load_default()
-
-    draw.text((40, 30), f"📊 Daily Market Dashboard ({now_str})", fill="#ffffff", font=font_title)
-    draw.line([(40, 75), (760, 75)], fill="#45475a", width=2)
-
-    # 코인 시세 (업비트 API)
-    try:
-        res = requests.get("https://api.upbit.com/v1/ticker?markets=KRW-BTC").json()
-        btc_price = f"{res[0]['trade_price']:,} KRW"
-        btc_change = f"{res[0]['signed_change_rate'] * 100:+.2f}%"
-    except:
-        btc_price, btc_change = "N/A", "0.00%"
-
-    draw.rectangle([(40, 100), (370, 240)], fill="#252538", outline="#585b70", width=1)
-    draw.text((60, 120), "🪙 Bitcoin (BTC)", fill="#cdd6f4", font=font_sub)
-    draw.text((60, 155), btc_price, fill="#ffffff", font=font_title)
-    color = "#f38ba8" if "-" in btc_change else "#a6e3a1"
-    draw.text((60, 195), f"24h: {btc_change}", fill=color, font=font_sub)
-
-    # 주요 시세 링크 안내 카드
-    draw.rectangle([(400, 100), (760, 240)], fill="#252538", outline="#585b70", width=1)
-    draw.text((420, 120), "📈 Quick Market Links", fill="#cdd6f4", font=font_sub)
-    draw.text((420, 155), "• KOSPI / KOSDAQ Index", fill="#a6adc8", font=font_sub)
-    draw.text((420, 185), "• USD/KRW Exchange Rate", fill="#a6adc8", font=font_sub)
-
-    img.save(output_path)
-    return output_path
-
-# --- 1. 30분 단위 특정 키워드 감시 ---
-def run_keyword_monitor():
-    history = load_history()
-    keywords = ["농협", "농협금융"]
-    new_history = set(history)
-
-    for kw in keywords:
-        rss_url = f"https://news.google.com/rss/search?q={kw}&hl=ko&gl=KR&ceid=KR:ko"
-        feed = feedparser.parse(rss_url)
-
-        for entry in feed.entries[:3]:
-            link = entry.link
-            title = clean_html(entry.title)
-
-            if link in history:
+            except (TypeError, ValueError):
                 continue
 
-            # [키워드 알림] 대신 [{kw}] 형태로 전송
-            msg = f"🚨 <b>[{kw}]</b>\n\n" \
-                  f"📌 <a href='{link}'>{title}</a>"
+        history[mode] = dict(
+            sorted(
+                retained.items(),
+                key=lambda item: item[1],
+                reverse=True
+            )[:1500]
+        )
 
-            send_telegram_text(msg)
-            new_history.add(link)
+    HISTORY_FILE.write_text(
+        json.dumps(
+            history,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
 
-    save_history(new_history)
 
-# --- 2. 종합 뉴스 브리핑 ---
-def run_daily_briefing():
-    history = load_history()
-    new_history = set(history)
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+# --------------------------------------------------
+# 3. 텔레그램 메시지 전송
+# --------------------------------------------------
+def telegram(method, data, files=None):
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TOKEN}/{method}"
+    )
 
-    # 1) 대시보드 이미지 생성 및 전송
-    image_path = create_dashboard_image()
-    send_telegram_photo(image_path, caption=f"📰 <b>종합 뉴스 브리핑 ({now_str})</b>")
+    response = session.post(
+        url,
+        data=data,
+        files=files,
+        timeout=25
+    )
 
-    # 2) 카테고리별 중복 제거 뉴스 브리핑 전송
-    briefing_text = ""
-    has_new_articles = False
+    response.raise_for_status()
+    result = response.json()
 
-    for category, rss_urls in BRIEFING_RSS_SOURCES.items():
-        category_articles = []
-        for url in rss_urls:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:3]:
-                link = entry.link
-                title = clean_html(entry.title)
+    if not result.get("ok"):
+        raise RuntimeError(
+            result.get(
+                "description",
+                "텔레그램 전송 실패"
+            )
+        )
 
-                if link in history:
-                    continue
+    return result
 
-                category_articles.append(f"• <a href='{link}'>{title}</a>")
-                new_history.add(link)
-                has_new_articles = True
 
-        if category_articles:
-            briefing_text += f"<b>[ {category} ]</b>\n" + "\n".join(category_articles[:4]) + "\n\n"
+def send_text(message):
+    return telegram(
+        "sendMessage",
+        {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true"
+        }
+    )
 
-    if has_new_articles:
-        send_telegram_text(briefing_text)
-        save_history(new_history)
 
-if __name__ == "__main__":
+# --------------------------------------------------
+# 4. RSS 뉴스 수집
+# --------------------------------------------------
+def read_feed(url):
+    try:
+        response = session.get(
+            url,
+            timeout=20
+        )
+        response.raise_for_status()
+
+        parsed = feedparser.parse(
+            response.content
+        )
+
+        if parsed.bozo and not parsed.entries:
+            raise ValueError("RSS 형식 오류")
+
+        return parsed.entries[:15]
+
+    except (
+        requests.RequestException,
+        ValueError
+    ) as exc:
+        logging.warning(
+            "RSS 수집 실패 (%s): %s",
+            url,
+            exc
+        )
+        return []
+
+
+def published_at(entry):
+    structured = (
+        entry.get("published_parsed")
+        or entry.get("updated_parsed")
+    )
+
+    if structured:
+        try:
+            return datetime(
+                *structured[:6],
+                tzinfo=timezone.utc
+            ).astimezone(KST)
+
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def article_from_entry(entry):
+    title = clean(
+        entry.get("title")
+    )
+    link = entry.get(
+        "link", ""
+    ).strip()
+
+    if (
+        not title
+        or urlparse(link).scheme
+        not in ("https", "http")
+    ):
+        return None
+
+    return {
+        "title": title,
+        "link": link,
+        "summary_html": entry.get(
+            "summary", ""
+        ),
+        "date": published_at(entry),
+        "key": history_key(title)
+    }
+
+
+# --------------------------------------------------
+# 5. 기사 요약 추출
+# RSS 요약 우선 → 기사 메타 설명
+# --------------------------------------------------
+def summary_for(article):
+    summary = clean(
+        article["summary_html"]
+    )
+
+    title_start = clean(
+        article["title"]
+    ).casefold()[:45]
+
+    # 기사 제목과 출처만 있는 RSS 설명은 제외
+    if (
+        len(summary) < 45
+        or summary.casefold().startswith(title_start)
+    ):
+        summary = ""
+
+    host = urlparse(
+        article["link"]
+    ).netloc.lower()
+
+    # 일반 언론사 페이지의 설명 태그 확인
+    if (
+        not summary
+        and "news.google.com" not in host
+    ):
+        try:
+            response = session.get(
+                article["link"],
+                timeout=10
+            )
+            response.raise_for_status()
+
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser"
+            )
+
+            tag = soup.find(
+                "meta",
+                attrs={"name": "description"}
+            )
+
+            if not tag:
+                tag = soup.find(
+                    "meta",
+                    attrs={
+                        "property": "og:description"
+                    }
+                )
+
+            if tag:
+                summary = clean(
+                    tag.get("content", "")
+                )
+
+        except requests.RequestException:
+            pass
+
+    summary = summary.strip()
+
+    if not summary:
+        return (
+            "요약을 제공하지 않는 기사입니다. "
+            "링크에서 본문을 확인해 주세요."
+        )
+
+    return (
+        summary[:170].rstrip()
+        + ("…" if len(summary) > 170 else "")
+    )
+
+
+def article_message(article, header):
+    title = html.escape(
+        article["title"]
+    )
+    summary = html.escape(
+        summary_for(article)
+    )
+    link = html.escape(
+        article["link"],
+        quote=True
+    )
+
+    return (
+        f"{header}\n"
+        f"<b>📰 {title}</b>\n"
+        f"📝 {summary}\n"
+        f'🔗 <a href="{link}">기사 보기</a>'
+    )
+
+
+# --------------------------------------------------
+# 6. 비트코인 / 이더리움 시세 이미지
+# --------------------------------------------------
+def draw_dashboard(path="dashboard.png"):
+    image = Image.new(
+        "RGB",
+        (800, 280),
+        "#1e1e2e"
+    )
+    draw = ImageDraw.Draw(image)
+
+    font_dir = (
+        "/usr/share/fonts/truetype/nanum/"
+    )
+
+    try:
+        big = ImageFont.truetype(
+            font_dir + "NanumGothicBold.ttf",
+            24
+        )
+        small = ImageFont.truetype(
+            font_dir + "NanumGothic.ttf",
+            17
+        )
+    except OSError:
+        big = small = ImageFont.load_default()
+
+    now_str = datetime.now(KST).strftime(
+        "%Y-%m-%d %H:%M KST"
+    )
+
+    draw.text(
+        (35, 24),
+        "Market Dashboard  " + now_str,
+        font=big,
+        fill="white"
+    )
+
+    draw.line(
+        (35, 70, 765, 70),
+        fill="#585b70",
+        width=2
+    )
+
+    prices = {}
+
+    try:
+        response = session.get(
+            "https://api.upbit.com/v1/ticker",
+            params={
+                "markets": "KRW-BTC,KRW-ETH"
+            },
+            timeout=12
+        )
+        response.raise_for_status()
+
+        prices = {
+            item["market"]: item
+            for item in response.json()
+        }
+
+    except (
+        requests.RequestException,
+        ValueError,
+        KeyError,
+        TypeError
+    ) as exc:
+        logging.warning(
+            "시세 조회 실패: %s",
+            exc
+        )
+
+    markets = [
+        ("KRW-BTC", "Bitcoin (BTC)"),
+        ("KRW-ETH", "Ethereum (ETH)")
+    ]
+
+    for idx, (market, label) in enumerate(markets):
+        left = 35 + idx * 375
+
+        draw.rounded_rectangle(
+            (
+                left, 95,
+                left + 355, 230
+            ),
+            radius=12,
+            fill="#29293d"
+        )
+
+        draw.text(
+            (left + 20, 112),
+            label,
+            font=small,
+            fill="#cdd6f4"
+        )
+
+        item = prices.get(market)
+
+        if item:
+            price = (
+                f"{item['trade_price']:,.0f} KRW"
+            )
+            change = (
+                "전일 대비 "
+                f"{item['signed_change_rate'] * 100:+.2f}%"
+            )
+        else:
+            price = "조회 실패"
+            change = "시세 제공 일시 중단"
+
+        draw.text(
+            (left + 20, 149),
+            price,
+            font=big,
+            fill="white"
+        )
+
+        draw.text(
+            (left + 20, 193),
+            change,
+            font=small,
+            fill="#a6e3a1"
+        )
+
+    image.save(path)
+    return path
+
+
+def send_dashboard():
+    path = draw_dashboard()
+
+    try:
+        with open(path, "rb") as image:
+            telegram(
+                "sendPhoto",
+                {
+                    "chat_id": CHAT_ID,
+                    "caption": (
+                        "📊 종합 뉴스 브리핑 | "
+                        + datetime.now(KST).strftime(
+                            "%m/%d %H:%M"
+                        )
+                    )
+                },
+                files={"photo": image}
+            )
+
+    finally:
+        Path(path).unlink(
+            missing_ok=True
+        )
+
+
+# --------------------------------------------------
+# 7. 기사 수집 및 날짜별 정렬
+# --------------------------------------------------
+def collect(urls, max_age_hours):
+    articles = []
+
+    cutoff = (
+        datetime.now(KST)
+        - timedelta(hours=max_age_hours)
+    )
+
+    for url in urls:
+        for entry in read_feed(url):
+            article = article_from_entry(entry)
+
+            if (
+                article
+                and (
+                    article["date"] is None
+                    or article["date"] >= cutoff
+                )
+            ):
+                articles.append(article)
+
+    articles.sort(
+        key=lambda a: (
+            a["date"]
+            or datetime.min.replace(tzinfo=KST)
+        ),
+        reverse=True
+    )
+
+    return articles
+
+
+# --------------------------------------------------
+# 8. 농협 관련 키워드 뉴스
+# --------------------------------------------------
+def run_keyword(history):
+    keywords = [
+        "농협",
+        "농협금융"
+    ]
+
+    urls = [
+        (
+            "https://news.google.com/rss/search"
+            f"?q={quote(word)}"
+            "&hl=ko&gl=KR&ceid=KR:ko"
+        )
+        for word in keywords
+    ]
+
+    articles = collect(
+        urls,
+        max_age_hours=48
+    )
+
+    seen = set(
+        history["keyword"]
+    )
+
+    sent = 0
+
+    for article in articles:
+        if (
+            article["key"] in seen
+            or article["link"] in seen
+        ):
+            continue
+
+        send_text(
+            article_message(
+                article,
+                "🚨 <b>[농협 관련 뉴스]</b>"
+            )
+        )
+
+        history["keyword"][
+            article["key"]
+        ] = datetime.now(KST).isoformat()
+
+        seen.add(
+            article["key"]
+        )
+
+        sent += 1
+
+        # 한 번 실행할 때 최대 5건
+        if sent >= 5:
+            break
+
+    logging.info(
+        "키워드 뉴스 발송: %s건",
+        sent
+    )
+
+
+# --------------------------------------------------
+# 9. 정기 종합 뉴스 브리핑
+# --------------------------------------------------
+def run_brief(history):
+    try:
+        send_dashboard()
+
+    except (
+        requests.RequestException,
+        ValueError,
+        RuntimeError
+    ) as exc:
+        logging.warning(
+            "대시보드 발송 실패: %s",
+            exc
+        )
+
+    total = 0
+
+    for category, urls in SOURCES.items():
+        selected = []
+        seen = set(
+            history["brief"]
+        )
+
+        articles = collect(
+            urls,
+            max_age_hours=72
+        )
+
+        for article in articles:
+            if (
+                article["key"] in seen
+                or article["link"] in seen
+            ):
+                continue
+
+            selected.append(article)
+            seen.add(
+                article["key"]
+            )
+
+            # 카테고리별 최대 4건
+            if len(selected) >= 4:
+                break
+
+        if not selected:
+            continue
+
+        header = (
+            "<b>["
+            + html.escape(category)
+            + "]</b>"
+        )
+
+        message = "\n\n".join(
+            article_message(
+                article,
+                header if i == 0 else ""
+            )
+            for i, article in enumerate(selected)
+        )
+
+        # 전송 성공 이후에만 이력 반영
+        send_text(message)
+
+        timestamp = datetime.now(
+            KST
+        ).isoformat()
+
+        for article in selected:
+            history["brief"][
+                article["key"]
+            ] = timestamp
+
+        total += len(selected)
+
+    logging.info(
+        "정기 브리핑 발송: %s건",
+        total
+    )
+
+
+# --------------------------------------------------
+# 10. 실행 설정
+# --------------------------------------------------
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["keyword", "brief"], required=True)
+
+    parser.add_argument(
+        "--mode",
+        choices=["keyword", "brief"],
+        required=True
+    )
+
     args = parser.parse_args()
 
-    if args.mode == "keyword":
-        run_keyword_monitor()
-    elif args.mode == "brief":
-        run_daily_briefing()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s"
+    )
+
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError(
+            "GitHub Secrets의 "
+            "TELEGRAM_TOKEN / CHAT_ID를 확인하세요."
+        )
+
+    history = load_history()
+
+    try:
+        if args.mode == "keyword":
+            run_keyword(history)
+        else:
+            run_brief(history)
+
+    finally:
+        save_history(history)
+
+
+if __name__ == "__main__":
+    main()
