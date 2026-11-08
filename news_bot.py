@@ -349,10 +349,25 @@ def summary_for(article):
     )
 
 
+
 def article_message(article, header):
-    title = html.escape(
-        article["title"]
+    title = html.escape(article["title"])
+    summary = html.escape(summary_for(article))
+    link = html.escape(article["link"], quote=True)
+
+    # 기사 발행 날짜 및 시간 (한국시간)
+    if article["date"] is not None:
+        time_text = article["date"].astimezone(KST).strftime("%m/%d %H:%M")
+    else:
+        time_text = "날짜 미상"
+
+    return (
+        f"{header}\n"
+        f"<b>📰 {title} [{time_text}]</b>\n"
+        f"📝 {summary}\n"
+        f'🔗 <a href="{link}">기사 보기</a>'
     )
+
     summary = html.escape(
         summary_for(article)
     )
