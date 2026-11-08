@@ -444,14 +444,38 @@ def trend_color(value):
     return NEUTRAL
 
 
+
 def fnt(size, bold=False):
+    # Render와 GitHub Actions에서 동일한 한글 폰트 사용
+    filename = (
+        "NanumGothic-Bold.ttf"
+        if bold
+        else "NanumGothic-Regular.ttf"
+    )
+
+    local_font = Path("fonts") / filename
+
+    if local_font.exists():
+        return ImageFont.truetype(
+            str(local_font), size
+        )
+
+    # 기존 GitHub Actions 환경 지원
     font_dir = "/usr/share/fonts/truetype/nanum/"
-    filename = "NanumGothicBold.ttf" if bold else "NanumGothic.ttf"
+    old_name = (
+        "NanumGothicBold.ttf"
+        if bold
+        else "NanumGothic.ttf"
+    )
 
     try:
-        return ImageFont.truetype(font_dir + filename, size)
+        return ImageFont.truetype(
+            font_dir + old_name,
+            size
+        )
     except OSError:
         return ImageFont.load_default()
+
 
 
 def put(draw, x, y, value, size=24, color=TEXT, bold=False, right=None):
