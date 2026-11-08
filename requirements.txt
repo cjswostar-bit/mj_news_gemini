@@ -3,3 +3,5 @@ requests
 feedparser
 beautifulsoup4
 Pillow
+Flask
+gunicorn
